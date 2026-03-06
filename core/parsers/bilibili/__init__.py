@@ -1,7 +1,8 @@
 import asyncio
 from re import Match
-from typing import ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
+from aiohttp import ClientTimeout
 from bilibili_api import request_settings, select_client
 from bilibili_api.opus import Opus
 from bilibili_api.video import Video, VideoCodecs, VideoQuality
@@ -12,6 +13,7 @@ from astrbot.api import logger
 from ...config import PluginConfig
 from ...data import ImageContent, MediaContent, Platform
 from ...exception import DownloadException, DurationLimitException
+from ...utils import LimitedSizeDict
 from ..base import (
     BaseParser,
     Downloader,
@@ -19,6 +21,9 @@ from ..base import (
     handle,
 )
 from .login import BilibiliLogin
+
+if TYPE_CHECKING:
+    from .video import PageInfo, VideoInfo
 
 # 选择客户端
 select_client("curl_cffi")
@@ -30,6 +35,8 @@ request_settings.set("impersonate", "chrome131")
 class BilibiliParser(BaseParser):
     # 平台信息
     platform: ClassVar[Platform] = Platform(name="bilibili", display_name="B站")
+    _OFFICIAL_SUMMARY_UNSUPPORTED = "该视频暂不支持AI总结"
+    _LLM_FALLBACK_HINT = "可开启 bili_llm_fallback 并配置 LLM 进行兜底"
 
     def __init__(self, config: PluginConfig, downloader: Downloader):
         super().__init__(config, downloader)
@@ -49,6 +56,13 @@ class BilibiliParser(BaseParser):
         )
 
         self.login = BilibiliLogin(config)
+        self._cid_cache: LimitedSizeDict[str, int | None] = LimitedSizeDict(
+            max_size=512
+        )
+        self._subtitle_cache: LimitedSizeDict[str, str | None] = LimitedSizeDict(
+            max_size=256
+        )
+        self._summary_cache: LimitedSizeDict[str, str] = LimitedSizeDict(max_size=256)
 
     @handle("b23.tv", r"b23\.tv/[A-Za-z\d\._?%&+\-=/#]+")
     @handle("bili2233", r"bili2233\.cn/[A-Za-z\d\._?%&+\-=/#]+")
@@ -126,6 +140,384 @@ class BilibiliParser(BaseParser):
         opus_id = int(searched.group("opus_id"))
         return await self.parse_opus(opus_id)
 
+    @staticmethod
+    def _build_video_url(bvid: str, page_index: int) -> str:
+        url = f"https://www.bilibili.com/video/{bvid}"
+        return url + f"?p={page_index + 1}" if page_index > 0 else url
+
+    def _llm_fallback_missing_fields(self) -> list[str]:
+        missing: list[str] = []
+        if not self.cfg.bili_llm_api_base:
+            missing.append("bili_llm_api_base")
+        if not self.cfg.bili_llm_model:
+            missing.append("bili_llm_model")
+        return missing
+
+    @staticmethod
+    def _normalize_summary_text(text: str) -> str:
+        """
+        统一清洗 LLM 文本，避免回包出现 Markdown 代码块或多余空行。
+        """
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            lines = [line for line in cleaned.splitlines() if not line.strip().startswith("```")]
+            cleaned = "\n".join(lines).strip()
+        lines = [line.rstrip() for line in cleaned.splitlines()]
+        return "\n".join(line for line in lines if line.strip()).strip()
+
+    @staticmethod
+    def _humanize_llm_error(err: str | None) -> str:
+        if not err:
+            return "未知错误"
+        low = err.lower()
+        if "http 401" in low or "http 403" in low:
+            return "接口鉴权失败，请检查 bili_llm_api_key"
+        if "http 404" in low:
+            return "接口地址无效，请检查 bili_llm_api_base"
+        if "http 429" in low:
+            return "接口限流，请稍后重试"
+        if "timeout" in low:
+            return "接口超时，可调大 bili_llm_timeout"
+        if "http 5" in low:
+            return "接口服务异常（5xx）"
+        if "empty completion" in low:
+            return "模型返回为空"
+        return err[:120]
+
+    def _summary_cache_key(
+        self,
+        *,
+        bvid: str,
+        page_index: int,
+    ) -> str:
+        """
+        总结缓存 key。包含兜底配置，避免不同模型/配置相互污染。
+        """
+        return "|".join(
+            [
+                bvid,
+                str(page_index),
+                str(int(self.cfg.bili_llm_fallback)),
+                self.cfg.bili_llm_api_base,
+                self.cfg.bili_llm_model,
+                str(self.cfg.bili_llm_max_chars),
+            ]
+        )
+
+    async def _get_page_cid(
+        self,
+        *,
+        video: Video,
+        bvid: str,
+        page_index: int,
+    ) -> int | None:
+        cache_key = f"{bvid}:{page_index}"
+        if cache_key in self._cid_cache:
+            return self._cid_cache[cache_key]
+        try:
+            cid = await video.get_cid(page_index)
+        except Exception as e:
+            logger.debug(f"获取 cid 失败: {e}")
+            cid = None
+        self._cid_cache[cache_key] = cid
+        return cid
+
+    @staticmethod
+    def _extract_llm_text(data: dict[str, Any]) -> str:
+        """
+        兼容多种 OpenAI 风格返回：
+        - choices[0].message.content (str / list)
+        - choices[0].text
+        - output_text
+        """
+
+        def _flatten_content(content: Any) -> str:
+            if isinstance(content, str):
+                return content.strip()
+            if isinstance(content, list):
+                parts: list[str] = []
+                for item in content:
+                    if isinstance(item, str):
+                        parts.append(item.strip())
+                        continue
+                    if not isinstance(item, dict):
+                        continue
+                    for key in ("text", "content", "output_text"):
+                        val = item.get(key)
+                        if isinstance(val, str) and val.strip():
+                            parts.append(val.strip())
+                            break
+                return "\n".join(p for p in parts if p).strip()
+            return ""
+
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0]
+            if isinstance(first, dict):
+                message = first.get("message")
+                if isinstance(message, dict):
+                    text = _flatten_content(message.get("content"))
+                    if text:
+                        return text
+                text_field = first.get("text")
+                if isinstance(text_field, str) and text_field.strip():
+                    return text_field.strip()
+
+        output_text = data.get("output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+        if isinstance(output_text, list):
+            merged = "\n".join(
+                x.strip() for x in output_text if isinstance(x, str) and x.strip()
+            ).strip()
+            if merged:
+                return merged
+
+        return ""
+
+    async def _get_official_ai_summary(
+        self,
+        *,
+        video: Video,
+        cid: int | None,
+    ) -> tuple[str, bool]:
+        """
+        返回值:
+        - summary 文本
+        - 是否成功拿到官方 AI 总结
+        """
+        from .video import AIConclusion
+
+        if not self.login._credential:
+            return "哔哩哔哩 cookie 未配置或失效, 无法使用 AI 总结", False
+        if cid is None:
+            return "官方AI总结获取失败", False
+
+        try:
+            ai_conclusion = await video.get_ai_conclusion(cid)
+            ai_conclusion = convert(ai_conclusion, AIConclusion)
+            summary = ai_conclusion.summary
+            return summary, summary != self._OFFICIAL_SUMMARY_UNSUPPORTED
+        except Exception as e:
+            logger.warning(f"获取 B 站官方 AI 总结失败: {e}")
+            return "官方AI总结获取失败", False
+
+    async def _fetch_subtitle_text(
+        self,
+        *,
+        bvid: str,
+        cid: int,
+    ) -> str | None:
+        """
+        拉取 B 站字幕文本（优先第一个字幕轨道）。
+        """
+        cache_key = f"{bvid}:{cid}"
+        if cache_key in self._subtitle_cache:
+            return self._subtitle_cache[cache_key]
+
+        api = "https://api.bilibili.com/x/player/v2"
+        try:
+            async with self.session.get(
+                api,
+                params={"bvid": bvid, "cid": cid},
+                headers=self.headers,
+                proxy=self.proxy,
+            ) as resp:
+                if resp.status >= 400:
+                    self._subtitle_cache[cache_key] = None
+                    return None
+                player_data = await resp.json(content_type=None)
+        except Exception as e:
+            logger.debug(f"获取字幕元信息失败: {e}")
+            self._subtitle_cache[cache_key] = None
+            return None
+
+        subtitles = (
+            player_data.get("data", {})
+            .get("subtitle", {})
+            .get("subtitles", [])
+        )
+        if not subtitles:
+            self._subtitle_cache[cache_key] = None
+            return None
+
+        subtitle_url = subtitles[0].get("subtitle_url")
+        if not subtitle_url:
+            self._subtitle_cache[cache_key] = None
+            return None
+        if subtitle_url.startswith("//"):
+            subtitle_url = f"https:{subtitle_url}"
+
+        try:
+            async with self.session.get(
+                subtitle_url,
+                headers=self.headers,
+                proxy=self.proxy,
+            ) as resp:
+                if resp.status >= 400:
+                    self._subtitle_cache[cache_key] = None
+                    return None
+                subtitle_data = await resp.json(content_type=None)
+        except Exception as e:
+            logger.debug(f"获取字幕内容失败: {e}")
+            self._subtitle_cache[cache_key] = None
+            return None
+
+        body = subtitle_data.get("body", [])
+        if not isinstance(body, list):
+            self._subtitle_cache[cache_key] = None
+            return None
+        text = "\n".join(
+            item.get("content", "").strip()
+            for item in body
+            if isinstance(item, dict) and item.get("content")
+        ).strip()
+        result = text or None
+        self._subtitle_cache[cache_key] = result
+        return result
+
+    async def _llm_summarize(
+        self, *, title: str, url: str, source_text: str
+    ) -> tuple[str | None, str | None]:
+        """
+        使用 OpenAI 兼容接口总结文本。
+        """
+        endpoint = f"{self.cfg.bili_llm_api_base}/chat/completions"
+        payload: dict[str, Any] = {
+            "model": self.cfg.bili_llm_model,
+            "temperature": 0.2,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是中文视频内容总结助手。"
+                        "请严格按以下格式输出：\n"
+                        "【一句话概述】...\n"
+                        "【核心要点】\n"
+                        "1. ...\n"
+                        "2. ...\n"
+                        "3. ...\n"
+                        "【结论】...\n"
+                        "要求：中文、信息准确、总长度控制在120~260字。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"请对下面视频内容做中文总结（120~220字）。\n"
+                        f"- 标题: {title}\n"
+                        f"- 链接: {url}\n"
+                        f"- 重点: 主题、核心观点、结论/建议。\n\n"
+                        f"内容如下：\n{source_text}"
+                    ),
+                },
+            ],
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.cfg.bili_llm_api_key:
+            headers["Authorization"] = f"Bearer {self.cfg.bili_llm_api_key}"
+
+        try:
+            async with self.session.post(
+                endpoint,
+                json=payload,
+                headers=headers,
+                proxy=self.proxy,
+                timeout=ClientTimeout(total=self.cfg.bili_llm_timeout),
+            ) as resp:
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.warning(f"LLM 总结请求失败: HTTP {resp.status}, {body[:200]}")
+                    return None, f"HTTP {resp.status}: {body[:120]}"
+                data = await resp.json(content_type=None)
+        except Exception as e:
+            logger.warning(f"LLM 总结请求异常: {e}")
+            return None, str(e)[:120]
+
+        content = self._extract_llm_text(data)
+        if not content:
+            return None, "empty completion"
+        return self._normalize_summary_text(content), None
+
+    async def _get_summary_text(
+        self,
+        *,
+        video: Video,
+        video_info: "VideoInfo",
+        page_info: "PageInfo",
+    ) -> str:
+        """
+        优先官方 AI 总结，失败时可回退到 LLM 总结。
+        """
+        summary_cache_key = self._summary_cache_key(
+            bvid=video_info.bvid,
+            page_index=page_info.index,
+        )
+        cached_summary = self._summary_cache.get(summary_cache_key)
+        if cached_summary:
+            return cached_summary
+
+        cid = await self._get_page_cid(
+            video=video,
+            bvid=video_info.bvid,
+            page_index=page_info.index,
+        )
+
+        official_summary, official_ok = await self._get_official_ai_summary(
+            video=video,
+            cid=cid,
+        )
+        if official_ok:
+            self._summary_cache[summary_cache_key] = official_summary
+            return official_summary
+        if not self.cfg.bili_llm_fallback:
+            if official_summary == self._OFFICIAL_SUMMARY_UNSUPPORTED:
+                return f"{official_summary}（{self._LLM_FALLBACK_HINT}）"
+            return official_summary
+
+        missing = self._llm_fallback_missing_fields()
+        if missing:
+            if official_summary == self._OFFICIAL_SUMMARY_UNSUPPORTED:
+                return f"{official_summary}（LLM配置缺失: {', '.join(missing)}）"
+            return official_summary
+
+        source_text = ""
+        source_type = "字幕"
+        if cid is not None:
+            subtitle_text = await self._fetch_subtitle_text(
+                bvid=video_info.bvid,
+                cid=cid,
+            )
+            if subtitle_text:
+                source_text = subtitle_text
+
+        if not source_text:
+            source_type = "简介"
+            source_text = (video_info.desc or "").strip()
+        if not source_text:
+            if official_summary == self._OFFICIAL_SUMMARY_UNSUPPORTED:
+                return f"{official_summary}（LLM兜底失败: 无可用字幕或简介）"
+            return official_summary
+
+        max_chars = self.cfg.bili_llm_max_chars
+        source_text = source_text[:max_chars]
+        url = self._build_video_url(video_info.bvid, page_info.index)
+
+        llm_summary, llm_err = await self._llm_summarize(
+            title=page_info.title,
+            url=url,
+            source_text=source_text,
+        )
+        if not llm_summary:
+            if official_summary == self._OFFICIAL_SUMMARY_UNSUPPORTED:
+                detail = self._humanize_llm_error(llm_err)
+                return f"{official_summary}（LLM兜底失败: {detail}）"
+            return official_summary
+
+        result = f"LLM总结（基于{source_type}）:\n{llm_summary}"
+        self._summary_cache[summary_cache_key] = result
+        return result
+
     async def parse_video(
         self,
         *,
@@ -141,7 +533,7 @@ class BilibiliParser(BaseParser):
             page_num (int): 页码
         """
 
-        from .video import AIConclusion, VideoInfo
+        from .video import VideoInfo
 
         video = await self._get_video(bvid=bvid, avid=avid)
         # 转换为 msgspec struct
@@ -153,21 +545,19 @@ class BilibiliParser(BaseParser):
         # 处理分 p
         page_info = video_info.extract_info_with_page(page_num)
 
-        # 获取 AI 总结
-        if self.login._credential:
-            cid = await video.get_cid(page_info.index)
-            ai_conclusion = await video.get_ai_conclusion(cid)
-            ai_conclusion = convert(ai_conclusion, AIConclusion)
-            ai_summary = ai_conclusion.summary
-        else:
-            ai_summary: str = "哔哩哔哩 cookie 未配置或失效, 无法使用 AI 总结"
+        ai_summary = await self._get_summary_text(
+            video=video,
+            video_info=video_info,
+            page_info=page_info,
+        )
 
-        url = f"https://bilibili.com/{video_info.bvid}"
-        url += f"?p={page_info.index + 1}" if page_info.index > 0 else ""
+        url = self._build_video_url(video_info.bvid, page_info.index)
 
         # 视频下载 task
+        real_page_num = page_info.index + 1
+
         async def download_video():
-            output_path = self.cfg.cache_dir / f"{video_info.bvid}-{page_num}.mp4"
+            output_path = self.cfg.cache_dir / f"{video_info.bvid}-{real_page_num}.mp4"
             if output_path.exists():
                 return output_path
             v_url, a_url = await self.extract_download_urls(
@@ -191,7 +581,8 @@ class BilibiliParser(BaseParser):
                     proxy=self.proxy,
                 )
 
-        video_task = asyncio.create_task(download_video())
+        task_name = f"bili_video_{video_info.bvid}_p{real_page_num}"
+        video_task = asyncio.create_task(download_video(), name=task_name)
         video_content = self.create_video_content(
             video_task,
             page_info.cover,
@@ -207,6 +598,37 @@ class BilibiliParser(BaseParser):
             contents=[video_content],
             extra={"info": ai_summary},
         )
+
+    async def summarize_video(
+        self,
+        *,
+        bvid: str | None = None,
+        avid: int | None = None,
+        page_num: int = 1,
+    ) -> str:
+        """
+        只返回视频摘要文本，不下载媒体文件。
+        """
+        from .video import VideoInfo
+
+        video = await self._get_video(bvid=bvid, avid=avid)
+        video_info = convert(await video.get_info(), VideoInfo)
+        page_info = video_info.extract_info_with_page(page_num)
+        ai_summary = await self._get_summary_text(
+            video=video,
+            video_info=video_info,
+            page_info=page_info,
+        )
+        url = self._build_video_url(video_info.bvid, page_info.index)
+
+        lines = [
+            "B站视频总结",
+            f"标题: {page_info.title}",
+            f"UP: {video_info.owner.name}",
+            f"链接: {url}",
+            ai_summary,
+        ]
+        return "\n".join(lines)
 
     async def parse_dynamic(self, dynamic_id: int):
         """解析动态信息

@@ -11,6 +11,28 @@ from astrbot.api import logger
 from .config import ParserItem, PluginConfig
 
 
+def parse_cookie_string(cookies_str: str) -> dict[str, str]:
+    """
+    解析形如 ``k1=v1; k2=v2`` 的 Cookie 字符串。
+    忽略空片段和非法片段，避免因单个坏值导致整次解析失败。
+    """
+    parsed: dict[str, str] = {}
+    cleaned = cookies_str.replace("\n", "").replace("\r", "").strip()
+    if not cleaned:
+        return parsed
+
+    for item in cleaned.split(";"):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        name, value = item.split("=", 1)
+        name = name.strip()
+        if not name:
+            continue
+        parsed[name] = value.strip()
+    return parsed
+
+
 @dataclass(slots=True)
 class Cookie:
     domain: str
@@ -88,11 +110,7 @@ class CookieJar:
 
     def to_dict(self) -> dict[str, str]:
         """将 cookies 字符串转换为字典"""
-        res = {}
-        for cookie in self.cookies_str.split(";"):
-            name, value = cookie.strip().split("=", 1)
-            res[name] = value
-        return res
+        return parse_cookie_string(self.cookies_str)
 
     # ---------------- persistence ----------------
 
@@ -100,32 +118,36 @@ class CookieJar:
     def clean_cookies_str(cookies_str: str) -> str:
         return cookies_str.replace("\n", "").replace("\r", "").strip()
 
+    @staticmethod
+    def _mask_secret(value: str, *, keep: int = 3) -> str:
+        if not value:
+            return ""
+        if len(value) <= keep * 2:
+            return "*" * len(value)
+        return f"{value[:keep]}***{value[-keep:]}"
+
+    @classmethod
+    def _mask_cookie_header(cls, header: str) -> str:
+        parts = []
+        for name, value in parse_cookie_string(header).items():
+            parts.append(f"{name}={cls._mask_secret(value)}")
+        return "; ".join(parts)
+
     def _sync_cookies_str(self) -> None:
         self.cookies_str = "; ".join(f"{c.name}={c.value}" for c in self.cookies)
 
     def _load_from_cookies_str(self, cookies_str: str) -> None:
-        cookies_str = self.clean_cookies_str(cookies_str)
-        if not cookies_str:
+        parsed = parse_cookie_string(cookies_str)
+        if not parsed:
             return
 
-        for item in cookies_str.split(";"):
-            item = item.strip()
-            if not item or "=" not in item:
-                continue
-
-            parts = item.split("=", 1)
-            if len(parts) != 2:
-                continue
-
-            name, value = parts
-            if not name.strip():
-                continue
+        for name, value in parsed.items():
             self.cookies.append(
                 Cookie(
                     domain=f".{self.domain}",
                     path="/",
-                    name=name.strip(),
-                    value=value.strip(),
+                    name=name,
+                    value=value,
                     secure=True,
                     expires=0,
                 )
@@ -201,7 +223,7 @@ class CookieJar:
         ignored_items = []
 
         for header in set_cookie_headers:
-            logger.debug(f"解析 Set-Cookie: {header}")
+            logger.debug(f"解析 Set-Cookie: {self._mask_cookie_header(header)}")
 
             sc = SimpleCookie()
             sc.load(header)
@@ -260,11 +282,13 @@ class CookieJar:
                     existing.expires = expires
 
                     updated_items.append(
-                        (name, domain, path, old_value, value, secure, expires)
+                        (name, domain, path, secure, expires)
                     )
                     logger.debug(
                         f"Cookie 更新: {name} (domain={domain}, path={path}) "
-                        f"old_value={old_value} new_value={value} secure={secure} expires={expires}"
+                        f"old_value={self._mask_secret(old_value)} "
+                        f"new_value={self._mask_secret(value)} "
+                        f"secure={secure} expires={expires}"
                     )
                 else:
                     self.cookies.append(
@@ -277,10 +301,11 @@ class CookieJar:
                             expires=expires,
                         )
                     )
-                    added_items.append((name, domain, path, value, secure, expires))
+                    added_items.append((name, domain, path, secure, expires))
                     logger.debug(
                         f"Cookie 新增: {name} (domain={domain}, path={path}) "
-                        f"value={value} secure={secure} expires={expires}"
+                        f"value={self._mask_secret(value)} "
+                        f"secure={secure} expires={expires}"
                     )
 
                 updated = True
@@ -293,4 +318,4 @@ class CookieJar:
                 f"(新增 {len(added_items)}，更新 {len(updated_items)}，忽略 {len(ignored_items)})"
             )
             logger.debug(f"当前 Cookie 总数: {len(self.cookies)}")
-            logger.debug(f"当前 cookies_str: {self.cookies_str}")
+            logger.debug(f"当前 cookies_str: {self._mask_cookie_header(self.cookies_str)}")

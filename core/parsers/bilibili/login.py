@@ -8,6 +8,7 @@ from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
 from astrbot.api import logger
 
 from ...config import PluginConfig
+from ...cookie import parse_cookie_string
 
 
 class BilibiliLogin:
@@ -24,7 +25,8 @@ class BilibiliLogin:
             return
 
         self.credential_file.write_text(
-            json.dumps(self._credential.get_cookies(), ensure_ascii=False)
+            json.dumps(self._credential.get_cookies(), ensure_ascii=False),
+            encoding="utf-8",
         )
 
     def _load_credential(self):
@@ -33,7 +35,7 @@ class BilibiliLogin:
             return
 
         self._credential = Credential.from_cookies(
-            json.loads(self.credential_file.read_text())
+            json.loads(self.credential_file.read_text(encoding="utf-8"))
         )
 
     async def login_with_qrcode(self) -> bytes:
@@ -69,11 +71,7 @@ class BilibiliLogin:
 
     def _cookies_to_dict(self, cookies_str: str) -> dict[str, str]:
         """将 cookies 字符串转换为字典"""
-        res = {}
-        for cookie in cookies_str.split(";"):
-            name, value = cookie.strip().split("=", 1)
-            res[name] = value
-        return res
+        return parse_cookie_string(cookies_str)
 
     async def _init_credential(self):
         """初始化哔哩哔哩登录凭证"""
@@ -81,7 +79,13 @@ class BilibiliLogin:
             self._load_credential()
             return
 
-        credential = Credential.from_cookies(self._cookies_to_dict(self.raw_cookies))
+        cookies = self._cookies_to_dict(self.raw_cookies)
+        if not cookies:
+            logger.warning("B站 cookies 配置为空或格式无效，改为尝试加载本地凭证")
+            self._load_credential()
+            return
+
+        credential = Credential.from_cookies(cookies)
         if await credential.check_valid():
             logger.info(f"`parser_bili_ck` 有效, 保存到 {self.credential_file}")
             self._credential = credential

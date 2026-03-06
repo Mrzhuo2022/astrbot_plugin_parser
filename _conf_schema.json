@@ -124,6 +124,63 @@
         "type": "string",
         "default": "30 2 * * *"
     },
+    "cache_max_size_gb": {
+        "description": "缓存清理阈值(GB)",
+        "hint": "缓存目录体积超过该阈值时才执行清理。设为 0 表示不按大小限制，按 clean_cron 周期直接清理",
+        "type": "int",
+        "slider": {
+            "min": 0,
+            "max": 100,
+            "step": 1
+        },
+        "default": 0
+    },
+    "bili_llm_fallback": {
+        "description": "B站总结启用LLM兜底",
+        "hint": "当 B 站官方 AI 总结不可用时，尝试使用下方 OpenAI 兼容接口进行总结",
+        "type": "bool",
+        "default": false
+    },
+    "bili_llm_api_base": {
+        "description": "LLM接口地址",
+        "hint": "OpenAI 兼容接口基础地址，例如 https://api.openai.com/v1",
+        "type": "string",
+        "default": ""
+    },
+    "bili_llm_api_key": {
+        "description": "LLM API Key",
+        "hint": "用于调用 OpenAI 兼容接口的密钥。部分本地网关/服务可留空",
+        "type": "string",
+        "default": ""
+    },
+    "bili_llm_model": {
+        "description": "LLM模型名",
+        "hint": "例如 gpt-4o-mini、qwen-plus 等",
+        "type": "string",
+        "default": ""
+    },
+    "bili_llm_timeout": {
+        "description": "LLM请求超时(秒)",
+        "hint": "调用 LLM 接口时的超时时间",
+        "type": "int",
+        "slider": {
+            "min": 5,
+            "max": 120,
+            "step": 5
+        },
+        "default": 30
+    },
+    "bili_llm_max_chars": {
+        "description": "LLM输入最大字符数",
+        "hint": "摘要时送入模型的字幕/简介最大字符数",
+        "type": "int",
+        "slider": {
+            "min": 1000,
+            "max": 30000,
+            "step": 1000
+        },
+        "default": 12000
+    },
     "parsers_template": {
         "description": "解析器",
         "type": "template_list",

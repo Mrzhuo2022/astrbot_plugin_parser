@@ -233,6 +233,7 @@ class ParseResult:
         )
 
     def __repr__(self) -> str:
+        repost_repr = repr(self.repost) if self.repost else "None"
         return (
             f"platform: {self.platform.display_name}, "
             f"timestamp: {self.timestamp}, "
@@ -242,7 +243,7 @@ class ParseResult:
             f"author: {self.author}, "
             f"contents: {self.contents}, "
             f"extra: {self.extra}, "
-            f"repost: <<<<<<<{self.repost}>>>>>>, "
+            f"repost: {repost_repr}, "
             f"render_image: {self.render_image.name if self.render_image else 'None'}"
         )
 

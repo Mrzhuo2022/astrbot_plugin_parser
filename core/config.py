@@ -207,6 +207,13 @@ class PluginConfig(ConfigNode):
     proxy: str | None
 
     clean_cron: str
+    cache_max_size_gb: int
+    bili_llm_fallback: bool
+    bili_llm_api_base: str
+    bili_llm_api_key: str
+    bili_llm_model: str
+    bili_llm_timeout: int
+    bili_llm_max_chars: int
 
     parsers_template: list[dict[str, Any]]
 
@@ -223,6 +230,14 @@ class PluginConfig(ConfigNode):
 
         # ---------- 派生字段 ----------
         self.proxy = self.proxy or None
+        self.cache_max_size_gb = max(0, int(self.cache_max_size_gb or 0))
+        self.cache_max_size = self.cache_max_size_gb * 1024 * 1024 * 1024
+        self.bili_llm_fallback = bool(self.bili_llm_fallback)
+        self.bili_llm_api_base = (self.bili_llm_api_base or "").rstrip("/")
+        self.bili_llm_api_key = (self.bili_llm_api_key or "").strip()
+        self.bili_llm_model = (self.bili_llm_model or "").strip()
+        self.bili_llm_timeout = max(5, int(self.bili_llm_timeout or 30))
+        self.bili_llm_max_chars = max(1000, int(self.bili_llm_max_chars or 12000))
         self.max_duration = self.source_max_minute * 60
         self.max_size = self.source_max_size * 1024 * 1024
 

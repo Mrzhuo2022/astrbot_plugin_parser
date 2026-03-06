@@ -7,7 +7,7 @@ from astrbot.api import logger
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star
 from astrbot.core import AstrBotConfig
-from astrbot.core.message.components import At, Image, Json
+from astrbot.core.message.components import At, Image, Json, Plain
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
@@ -18,10 +18,34 @@ from .core.clean import CacheCleaner
 from .core.config import PluginConfig
 from .core.debounce import Debouncer
 from .core.download import Downloader
+from .core.exception import ParseException
 from .core.parsers import BaseParser, BilibiliParser
 from .core.render import Renderer
 from .core.sender import MessageSender
 from .core.utils import extract_json_url
+
+try:
+    from aiocqhttp.exceptions import ActionFailed as AioActionFailed
+except Exception:
+    AioActionFailed = None
+
+SUMMARY_CMD_RE = re.compile(r"^\s*(?:总结B站|总结b站|总结|bsummary)\s+", re.IGNORECASE)
+BILI_BV_URL_RE = re.compile(
+    r"bilibili\.com(?:/video)?/(?P<bvid>BV[0-9a-zA-Z]{10})(?:\?p=(?P<page_num>\d{1,3}))?",
+    re.IGNORECASE,
+)
+BILI_AV_URL_RE = re.compile(
+    r"bilibili\.com(?:/video)?/av(?P<avid>\d{6,})(?:\?p=(?P<page_num>\d{1,3}))?",
+    re.IGNORECASE,
+)
+BILI_BV_RE = re.compile(
+    r"(?P<bvid>BV[0-9a-zA-Z]{10})(?:\s+(?:p)?(?P<page_num>\d{1,3}))?$",
+    re.IGNORECASE,
+)
+BILI_AV_RE = re.compile(
+    r"av(?P<avid>\d{6,})(?:\s+(?:p)?(?P<page_num>\d{1,3}))?$",
+    re.IGNORECASE,
+)
 
 
 class ParserPlugin(Star):
@@ -111,6 +135,79 @@ class ParserPlugin(Star):
                 return parser
         raise ValueError(f"未找到类型为 {parser_type} 的 parser 实例")
 
+    @staticmethod
+    def _normalize_page_num(page_num_text: str | None) -> int:
+        if not page_num_text:
+            return 1
+        try:
+            page = int(page_num_text)
+        except ValueError:
+            return 1
+        return page if page > 0 else 1
+
+    def _extract_bili_summary_target(self, text: str) -> dict[str, str | int] | None:
+        """
+        从“总结命令”中提取 B 站视频定位参数。
+        支持:
+        - 总结 BVxxxx [p]
+        - 总结 av123456 [p]
+        - 总结 https://www.bilibili.com/video/BV...?... 
+        """
+        cmd_match = SUMMARY_CMD_RE.match(text)
+        if not cmd_match:
+            return None
+        payload = text[cmd_match.end() :].strip()
+        if not payload:
+            return None
+
+        if searched := BILI_BV_URL_RE.search(payload):
+            return {
+                "bvid": searched.group("bvid"),
+                "page_num": self._normalize_page_num(searched.group("page_num")),
+            }
+        if searched := BILI_AV_URL_RE.search(payload):
+            return {
+                "avid": int(searched.group("avid")),
+                "page_num": self._normalize_page_num(searched.group("page_num")),
+            }
+        if searched := BILI_BV_RE.search(payload):
+            return {
+                "bvid": searched.group("bvid"),
+                "page_num": self._normalize_page_num(searched.group("page_num")),
+            }
+        if searched := BILI_AV_RE.search(payload):
+            return {
+                "avid": int(searched.group("avid")),
+                "page_num": self._normalize_page_num(searched.group("page_num")),
+            }
+        return None
+
+    async def _should_skip_by_arbiter(self, event: AstrMessageEvent) -> bool:
+        if not isinstance(event, AiocqhttpMessageEvent) or event.is_private_chat():
+            return False
+
+        raw = event.message_obj.raw_message
+        if not isinstance(raw, dict):
+            logger.warning(f"Unexpected raw_message type: {type(raw)}")
+            return True
+
+        try:
+            ctx = ArbiterContext(
+                message_id=int(raw["message_id"]),
+                msg_time=int(raw["time"]),
+                self_id=int(raw["self_id"]),
+            )
+        except Exception:
+            logger.warning("raw_message 缺少必要字段，跳过解析")
+            return True
+
+        is_win = await self.arbiter.compete(bot=event.bot, ctx=ctx)
+        if not is_win:
+            logger.debug("Bot在仲裁中输了, 跳过解析")
+            return True
+        logger.debug("Bot在仲裁中胜出, 准备解析...")
+        return False
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
         """消息的统一入口"""
@@ -146,6 +243,43 @@ class ParserPlugin(Star):
         if isinstance(seg1, At) and str(seg1.qq) != self_id:
             return
 
+        # “只总结，不下载”分支
+        if SUMMARY_CMD_RE.match(text):
+            target = self._extract_bili_summary_target(text)
+            if target is None:
+                await event.send(
+                    event.chain_result(
+                        [
+                            Plain(
+                                "用法: 总结 BV号 [分P] 或 总结 av号 [分P] 或 总结 B站视频链接"
+                            )
+                        ]
+                    )
+                )
+                return
+
+            if await self._should_skip_by_arbiter(event):
+                return
+
+            try:
+                parser: BilibiliParser = self._get_parser_by_type(BilibiliParser)  # type: ignore
+            except ValueError:
+                await event.send(event.chain_result([Plain("B站解析器未启用")]))
+                return
+
+            try:
+                summary_text = await parser.summarize_video(**target)
+            except ParseException as e:
+                await event.send(event.chain_result([Plain(f"总结失败: {e}")]))
+                return
+            except Exception:
+                logger.exception("[总结异常] B站总结链路异常")
+                await event.send(event.chain_result([Plain("总结失败，请稍后重试")]))
+                return
+
+            await event.send(event.chain_result([Plain(summary_text)]))
+            return
+
         # 核心匹配逻辑 ：关键词 + 正则双重判定，汇集了所有解析器的正则对。
         keyword: str = ""
         searched: re.Match[str] | None = None
@@ -160,23 +294,8 @@ class ParserPlugin(Star):
         logger.debug(f"匹配结果: {keyword}, {searched}")
 
         # 仲裁机制
-        if isinstance(event, AiocqhttpMessageEvent) and not event.is_private_chat():
-            raw = event.message_obj.raw_message
-            if not isinstance(raw, dict):
-                logger.warning(f"Unexpected raw_message type: {type(raw)}")
-                return
-            is_win = await self.arbiter.compete(
-                bot=event.bot,
-                ctx=ArbiterContext(
-                    message_id=int(raw["message_id"]),
-                    msg_time=int(raw["time"]),
-                    self_id=int(raw["self_id"]),
-                ),
-            )
-            if not is_win:
-                logger.debug("Bot在仲裁中输了, 跳过解析")
-                return
-            logger.debug("Bot在仲裁中胜出, 准备解析...")
+        if await self._should_skip_by_arbiter(event):
+            return
 
         # 基于link防抖
         link = searched.group(0)
@@ -185,7 +304,14 @@ class ParserPlugin(Star):
             return
 
         # 解析
-        parse_res = await self.parser_map[keyword].parse(keyword, searched)
+        try:
+            parse_res = await self.parser_map[keyword].parse(keyword, searched)
+        except ParseException as e:
+            logger.warning(f"[解析失败] {keyword}: {e}")
+            return
+        except Exception:
+            logger.exception(f"[解析异常] {keyword} 处理链路异常")
+            return
 
         # 基于资源ID防抖
         resource_id = parse_res.get_resource_id()
@@ -194,7 +320,13 @@ class ParserPlugin(Star):
             return
 
         # 发送
-        await self.sender.send_parse_result(event, parse_res)
+        try:
+            await self.sender.send_parse_result(event, parse_res)
+        except Exception as e:
+            if AioActionFailed is not None and isinstance(e, AioActionFailed):
+                logger.warning(f"[发送失败] 协议端拒绝消息: {e}")
+                return
+            logger.exception("[发送异常] 消息下发失败")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("开启解析")
